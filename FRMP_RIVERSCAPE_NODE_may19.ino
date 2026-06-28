@@ -1,3 +1,6 @@
+//THIS IS V1. CHECKS EVERY 15 MINUTES AND COMMUNICATES EVERY 15. 
+//REPLACED BY V2 6/28/26. 
+
 #include <Wire.h>
 #include <Adafruit_BME680.h>
 #include <Adafruit_PM25AQI.h>
