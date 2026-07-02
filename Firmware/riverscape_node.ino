@@ -1,5 +1,5 @@
-//THIS IS V1 FOR RIVERSCAPE_NODE. CHECKS EVERY 15 MINUTES AND COMMUNICATES EVERY 15. 
-//REPLACED BY V2 6/28/26. 
+// THIS IS V2 FOR RIVERSCAPE_NODE. THIS CODE READS EVERY 15 MINUTES AND TIME BETWEEN COMMUNICATIONS DEPENDS ON BATTERY VOLTAGE
+// UP TO DATE AS OF 6/28/26
 
 #include <Wire.h>
 #include <Adafruit_BME680.h>
@@ -7,8 +7,21 @@
 #include <SensirionI2cScd4x.h>
 #include <Notecard.h>
 
+// Uncomment for testing: sample every 1 min, sync every 4 min
+// #define TEST_MODE
+
 #define NOTECARD_PRODUCT_UID "me.proton.areskoch:riverscape_node"
 #define usbSerial Serial
+
+#ifdef TEST_MODE
+  #define SLEEP_US  (1ULL * 60 * 1000000)             // 1 min
+  #define VOUTBOUND "usb:2;high:4;normal:4;low:8;dead:0"
+  #define VINBOUND  "usb:4;high:8;normal:8;low:16;dead:0"
+#else
+  #define SLEEP_US  (15ULL * 60 * 1000000)            // 15 min
+  #define VOUTBOUND "usb:30;high:60;normal:240;low:720;dead:0"
+  #define VINBOUND  "usb:60;high:120;normal:720;low:1440;dead:0"
+#endif
 
 Adafruit_BME680 bme;
 Adafruit_PM25AQI pmsa = Adafruit_PM25AQI();
@@ -16,37 +29,23 @@ SensirionI2cScd4x scd41;
 Notecard notecard;
 
 #define PMS_POWER_PIN 10
-#define SYNC_TIMEOUT_S 60
-
-void waitForSync() {
-  usbSerial.println("Waiting for sync...");
-  for (int i = 0; i < SYNC_TIMEOUT_S; i++) {
-    delay(1000);
-    J *req = notecard.newRequest("hub.sync.status");
-    J *res = notecard.requestAndResponse(req);
-    if (res) {
-      bool inProgress = JGetBool(res, "sync");
-      const char *status = JGetString(res, "status");
-      usbSerial.printf("  [%ds] %s\n", i + 1, status ? status : "...");
-      notecard.deleteResponse(res);
-      if (!inProgress && i > 2) {
-        usbSerial.println("Sync complete.");
-        return;
-      }
-    }
-  }
-  usbSerial.println("Sync timed out.");
-}
 
 void setup() {
   usbSerial.begin(115200);
   Wire.begin(3, 4);
   notecard.begin();
 
+  // Voltage thresholds — tighter than lipo defaults so we back off before brownout
+  J *vcfg = notecard.newRequest("card.voltage");
+  JAddStringToObject(vcfg, "mode", "usb:4.6;high:4.2;normal:3.7;low:3.4;dead:0");
+  notecard.sendRequest(vcfg);
+
+  // Voltage-variable sync — Notecard picks cadence based on battery state
   J *req = notecard.newRequest("hub.set");
-  JAddStringToObject(req, "product", NOTECARD_PRODUCT_UID);
-  JAddStringToObject(req, "mode", "periodic");
-  JAddNumberToObject(req, "outbound", 15);
+  JAddStringToObject(req, "product",   NOTECARD_PRODUCT_UID);
+  JAddStringToObject(req, "mode",      "periodic");
+  JAddStringToObject(req, "voutbound", VOUTBOUND);
+  JAddStringToObject(req, "vinbound",  VINBOUND);
   notecard.sendRequest(req);
 
   // BME688
@@ -89,9 +88,9 @@ void loop() {
   PM25_AQI_Data pms_data;
   float pm1 = 0, pm25 = 0, pm10 = 0;
   if (pmsa.read(&pms_data)) {
-    pm1  = pms_data.pm10_standard;   // PM1.0
-    pm25 = pms_data.pm25_standard;   // PM2.5
-    pm10 = pms_data.pm100_standard;  // PM10
+    pm1  = pms_data.pm10_standard;
+    pm25 = pms_data.pm25_standard;
+    pm10 = pms_data.pm100_standard;
   }
 
   // ── SCD41 ──
@@ -111,12 +110,12 @@ void loop() {
   J *vres = notecard.requestAndResponse(vreq);
   if (vres) {
     float voltage = JGetNumber(vres, "value");
-    batt_pct = constrain((voltage - 3.2f) / (4.2f - 3.2f) * 100.0f, 0.0f, 100.0f);
+    batt_pct = constrain((voltage - 3.4f) / (4.2f - 3.4f) * 100.0f, 0.0f, 100.0f);
     usbSerial.printf("BAT: %.2fV %.1f%%\n", voltage, batt_pct);
     notecard.deleteResponse(vres);
   }
 
-  // ── Queue note ──
+  // ── Queue note — Notecard will sync on its own schedule ──
   J *req = notecard.newRequest("note.add");
   JAddStringToObject(req, "file", "riverscape_data.qo");
   JAddBoolToObject(req, "sync", false);
@@ -133,16 +132,11 @@ void loop() {
   JAddItemToObject(req, "body", body);
   notecard.sendRequest(req);
 
-  // ── Force sync and wait ──
-  J *syncReq = notecard.newRequest("hub.sync");
-  notecard.sendRequest(syncReq);
-  waitForSync();
-
-  usbSerial.printf("Done → T:%.1fF H:%.1f P:%.1f VOC:%.2f PM1:%.1f PM2.5:%.1f PM10:%.1f CO2:%d BAT:%.1f%%\n",
+  usbSerial.printf("Queued → T:%.1fF H:%.1f P:%.1f VOC:%.2f PM1:%.1f PM2.5:%.1f PM10:%.1f CO2:%d BAT:%.1f%%\n",
     temp_f, humidity, pressure, voc_raw, pm1, pm25, pm10, co2_raw, batt_pct);
 
-  // ── Power down PMS, deep sleep 15 min ──
+  // ── Power down PMS, deep sleep ──
   if (PMS_POWER_PIN >= 0) digitalWrite(PMS_POWER_PIN, LOW);
-  esp_sleep_enable_timer_wakeup(15ULL * 60 * 1000000);
+  esp_sleep_enable_timer_wakeup(SLEEP_US);
   esp_deep_sleep_start();
 }
