@@ -1,11 +1,23 @@
-// THIS IS V2 FOR RIVERSCAPE_NODE. THIS CODE READS EVERY 15 MINUTES AND TIME BETWEEN COMMUNICATIONS DEPENDS ON BATTERY VOLTAGE
-// UP TO DATE AS OF 6/28/26
+// THIS IS V3 FOR RIVERSCAPE_NODE. READS EVERY 15 MINUTES, SYNCS HOURLY.
+// V3 CHANGES FROM V2:
+//   - PMS_POWER_PIN now wired to PMSA003I SET pad (soldered), NOT VIN.
+//     SET pin: HIGH = fan running, LOW = fan sleeping (per PMSA003I datasheet).
+//   - Added gpio_hold_en()/gpio_deep_sleep_hold_en() so the SET line
+//     actually holds LOW through deep sleep instead of floating/resetting.
+//   - Added gpio_hold_dis() on wake before driving the pin again.
+//   - Switched from voltage-adaptive sync back to fixed hourly outbound/inbound,
+//     now that the real drain source (fan never sleeping) is fixed and this
+//     node has solar. Revert to TEST_MODE-style adaptive bounds for
+//     non-solar/forest nodes if needed.
+//   - Added 30s post-wake warmup delay comment reminder (unchanged, already present).
 
 #include <Wire.h>
 #include <Adafruit_BME680.h>
 #include <Adafruit_PM25AQI.h>
 #include <SensirionI2cScd4x.h>
 #include <Notecard.h>
+#include "driver/gpio.h"
+#include "esp_sleep.h"
 
 // Uncomment for testing: sample every 1 min, sync every 4 min
 // #define TEST_MODE
@@ -18,9 +30,10 @@
   #define VOUTBOUND "usb:2;high:4;normal:4;low:8;dead:0"
   #define VINBOUND  "usb:4;high:8;normal:8;low:16;dead:0"
 #else
-  #define SLEEP_US  (15ULL * 60 * 1000000)            // 15 min
-  #define VOUTBOUND "usb:30;high:60;normal:240;low:720;dead:0"
-  #define VINBOUND  "usb:60;high:120;normal:720;low:1440;dead:0"
+  #define SLEEP_US  (15ULL * 60 * 1000000)            // 15 min sampling
+  // Fixed hourly sync — no longer voltage-adaptive now that fan shutoff is fixed.
+  #define VOUTBOUND "usb:30;high:60;normal:60;low:60;dead:0"
+  #define VINBOUND  "usb:60;high:60;normal:60;low:60;dead:0"
 #endif
 
 Adafruit_BME680 bme;
@@ -28,6 +41,8 @@ Adafruit_PM25AQI pmsa = Adafruit_PM25AQI();
 SensirionI2cScd4x scd41;
 Notecard notecard;
 
+// PMSA003I SET pin — soldered directly to the SET pad on the breakout.
+// NOT the STEMMA power rail. HIGH = fan on, LOW = fan sleep.
 #define PMS_POWER_PIN 10
 
 void setup() {
@@ -40,7 +55,7 @@ void setup() {
   JAddStringToObject(vcfg, "mode", "usb:4.6;high:4.2;normal:3.7;low:3.4;dead:0");
   notecard.sendRequest(vcfg);
 
-  // Voltage-variable sync — Notecard picks cadence based on battery state
+  // Fixed hourly sync
   J *req = notecard.newRequest("hub.set");
   JAddStringToObject(req, "product",   NOTECARD_PRODUCT_UID);
   JAddStringToObject(req, "mode",      "periodic");
@@ -56,10 +71,11 @@ void setup() {
   bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
   bme.setGasHeater(320, 150);
 
-  // PMSA003I
+  // ── PMSA003I: release hold from prior sleep, then wake the fan via SET ──
   if (PMS_POWER_PIN >= 0) {
+    gpio_hold_dis((gpio_num_t)PMS_POWER_PIN);
     pinMode(PMS_POWER_PIN, OUTPUT);
-    digitalWrite(PMS_POWER_PIN, HIGH);
+    digitalWrite(PMS_POWER_PIN, HIGH);   // SET high = fan running
   }
   usbSerial.println("Warming up PMS fan (30s)...");
   delay(30000);
@@ -132,11 +148,16 @@ void loop() {
   JAddItemToObject(req, "body", body);
   notecard.sendRequest(req);
 
-  usbSerial.printf("Queued → T:%.1fF H:%.1f P:%.1f VOC:%.2f PM1:%.1f PM2.5:%.1f PM10:%.1f CO2:%d BAT:%.1f%%\n",
+  usbSerial.printf("Queued -> T:%.1fF H:%.1f P:%.1f VOC:%.2f PM1:%.1f PM2.5:%.1f PM10:%.1f CO2:%d BAT:%.1f%%\n",
     temp_f, humidity, pressure, voc_raw, pm1, pm25, pm10, co2_raw, batt_pct);
 
-  // ── Power down PMS, deep sleep ──
-  if (PMS_POWER_PIN >= 0) digitalWrite(PMS_POWER_PIN, LOW);
+  // ── Sleep PMS via SET pin, hold state through deep sleep ──
+  if (PMS_POWER_PIN >= 0) {
+    digitalWrite(PMS_POWER_PIN, LOW);              // SET low = fan sleep
+    gpio_hold_en((gpio_num_t)PMS_POWER_PIN);        // lock this pin's state
+    gpio_deep_sleep_hold_en();                      // enable holds globally for deep sleep
+  }
+
   esp_sleep_enable_timer_wakeup(SLEEP_US);
   esp_deep_sleep_start();
 }
